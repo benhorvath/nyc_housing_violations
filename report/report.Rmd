@@ -1,0 +1,635 @@
+---
+title: "Modeling Housing Violations in New York City"
+author: "Ben Horvath"
+date: "December 9, 2018"
+output:
+  html_document:
+    theme: null
+    toc: true
+    css: ../../static/architect.css
+    template: ../../static/architect.html
+    pandoc_args: [
+      "--mathjax", "",
+      "--variable", "mathjax-url:https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML"]
+  pdf_document:
+    keep_tex: yes
+fontsize: 11pt
+geometry: null
+fontfamily: mathpazo
+fontfamilyoptions: osf,sc
+linestretch: 1.05
+header-includes:
+  \usepackage{eulervm}
+---
+
+```{r setup, include=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# TODO
+# ====
+# 
+```
+
+Load libraries:
+
+```{r, warning=FALSE, message=FALSE}
+library(corrplot)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(lme4)
+library(pscl)
+library(tidycensus)
+library(tidyr)
+
+source('../R/multiplot.R')
+```
+
+
+
+# Introduction
+
+The purpose of this document is to explore the relationship between 311 calls and housing violations in New York City. After investigating their statistical properties, and incorporating demographic variables, I develop a number of successful models for predicting housing violations in NYC zip codes. After testing each model on a hold-out set, the best model was a special Poisson regression method that accounted for 72 percent of variation in housing violations.
+
+311 is a phone number in New York City where citizens can make civil, non-emergency calls, e.g., reports of graffiti or noise complaints. The expectation is that geographic areas with higher 311 calls should produce more housing violations. A number of theories can plausibly account for this relationship: Areas with higher 311 calls are more prone to contacting authorities or are more closely watched by authorities, who then carry out more housing inspections. I will leave it to the reader to develop their own explanations.
+
+The end goal is to build a model to predict housing violations. A successful model could potentially allow the city government to plan and target housing inspections more efficiently.
+
+The first section of this paper describes the data and how it is assembled. Logs of 311 calls and housing violations from 2014 are pulled from [NYC's open data web site]( https://opendata.cityofnewyork.us/). Additionally, I use supplementary demographic data pulled from the U.S. Census Bureau (via [a very nice R package](https://github.com/walkerke/tidycensus) called `tidycensus`).
+
+
+
+# Data Collection
+
+## 311 Calls
+
+The 311 call logs are automatically updated every day on the NYC Open Data web site. The online records go back to 2010, and each year contains many calls. For the purposes of this project, I will limit my exploration to 2014.
+
+I used this `curl` call to download the dataset directly from the web site, and then used the `grep` command line tool to filter to 2014:
+
+```
+curl https://data.cityofnewyork.us/resource/fhrw-4uyv.csv?%24limit=5000&%24%24app_token=YOURAPPTOKENHERE | grep '2014-' > ./data/raw/311_calls_2014.csv
+```
+
+Note that this command requires a registration to get a token, and that I had to fiddle with various query parameters (especially `limit`!) to get exaclty what I wanted.
+
+Load the data:
+
+```{r, warning=FALSE, message=FALSE}
+raw_311 <- read.csv('../data/raw/311_calls_2014.csv', stringsAsFactors=TRUE)
+colnames(raw_311) <- c('address_type', 'agency', 'agency_name', 'bbl', 'borough',
+                       'bridge_highway_direction', 'bridge_highway_name',
+                       'bridge_highway_segment', 'city', 'closed_date',
+                       'community_board', 'complaint_type', 'created_date',
+                       'cross_street_1', 'cross_street_2', 'descriptor',
+                       'due_date', 'facility_type', 'incident_address',
+                       'incident_zip', 'intersection_street_1',
+                       'intersection_street_2', 'landmark', 'latitude',
+                       'location', 'location_address', 'location_city',
+                       'location_state', 'location_type', 'location_zip',
+                       'longitude', 'open_data_channel_type', 'park_borough',
+                       'park_facility_name', 'resolution_action_updated_date',
+                       'resolution_description', 'road_ramp', 'status', 
+                       'street_name', 'taxi_company_borough',
+                       'taxi_pick_up_location', 'unique_key', 'vehicle_type',
+                       'x_coordinate_state_plane', 'y_coordinate_state_plane')
+
+calls <- raw_311 %>%
+    rename(lat=latitude, lon=longitude) %>%
+    mutate(created_date = as.Date(created_date, '%Y-%m-%dT%X')) %>%
+    filter(year(created_date) == 2014) %>%
+    drop_na(lat, lon)
+
+rm(raw_311); gc()  # garbage collection!
+
+head(calls)
+```
+
+The scale of 311 calls over a year is immediately apparent: Nearly 2 million calls in 2014!
+
+Especially important are the geographic information (address, borough, latitude and longitude), creation and close date, and compaint type.
+
+
+## Housing Violations
+
+This data set was also pulled from the NYC Open Data web site, using a similar `bash` formulation:
+
+```
+curl https://data.cityofnewyork.us/resource/b2iz-pps8.csv?%24limit=5000&%24%24app_token=YOURAPPTOKENHERE > ./data/raw/housing_violations.csv
+```
+
+Note that this data set is also updated daily, but does not extend as far back in time as the `calls` dataset.
+
+Load the dataset:
+
+```{r}
+house <- read.csv('../data/raw/housing_violations.csv', stringsAsFactors=FALSE)
+
+house <- house %>%
+    mutate(approveddate = as.Date(approveddate, '%Y-%m-%dT%X')) %>%
+    filter(year(approveddate) == 2014)
+
+head(house)
+```
+
+This housing violations data set is still substantial, but less voluminous than the `calls` dataset, at about 23 thousand violations in 2014. Important columns here include various dates (of inspection, certification, etc.), geographic information (address, lat/long, Census tract, etc.), a description of the violation, and violation status.
+
+
+## Census Demographics
+
+The U.S. Census Bureau makes all of their data available to the public, including with an API. Fortunately for us, some thoughtful data citizens have made an easy-to-use R package called `tidycensus`, making the process of accessing Census data quite simple. One simply needs to install the package and get an API key from the Census.
+
+Census data can be aggregated at various geographical levels. The smallest is by _census tract_, which is also conveniantly availabe in the `house` dataset. However, it is not in `calls`. It would be possible to use addresses in `calls` to get each observation's tract, but is would be tedious with nearly 2 million calls, even using an API. Additionally, it's possible that level of granularity might make the data too sparse. Instead, I chose zip code for aggregation by geographic. This is a reasonable compromise between granularity and the need to avoid sparseness. (Unfortunately `tidycensus` does not allow me to limit the data pull to just New York state if I request aggregation by zip code---I will have to filter the resulting dataset.)
+
+The Census tabulates hundreds of variables, many of which would be useful in this task. To keep the project managable, I focus on summarizing geographic zones by measures of  race/ethnicity, age, economic class, language, and education. Of course, most of these variables are related to eachother, and we should expect the problem of multicollinearity to crop up in the modeling phase.
+
+All sensitive permissions are stored in a config file (ignored by Git), accessible by sourcing the file.
+
+Load the data:
+
+```{r, warning=FALSE, message=FALSE}
+source('../R/config.R')
+
+nyc_zips <- unique(unlist(house$zip, calls$incident_zip))
+
+census_api_key(CENSUS_API_KEY)
+
+census <- get_acs(geography = 'zip code tabulation area', vintage = '2014',
+                  variables = c(total_pop ='B01001_001',
+                                pop_white = 'B01001H_001',  # not hispanic
+                                pop_black = 'B01001B_001',
+                                pop_hispanic = 'B01001I_001',
+                                median_age = 'B01002_001',
+                                below_poverty = 'B05010_002',
+                                speak_english = 'B06007_002',
+                                speak_spanish = 'B06007_003',
+                                bachelors = 'B06008_002',
+                                married = 'B06008_003',
+                                no_hs = 'B06009_002',
+                                hs = 'B06009_003',
+                                bach_degree = 'B06009_005',
+                                grad_degree = 'B06009_006',
+                                income_high = 'B06010_011'))  # $75k+
+
+census <- census %>% 
+    filter(GEOID %in% nyc_zips) %>%
+    select(-moe) %>%
+    spread(variable, estimate)
+```
+
+Normalize these variables by converting most to proportions of the zip code's total population:
+
+```{r}
+census <- census %>%
+    mutate(GEOID = as.integer(GEOID),
+           bach_degree = bach_degree / total_pop,
+           bachelors = bachelors / total_pop,
+           below_poverty = below_poverty/ total_pop,
+           grad_degree = grad_degree / total_pop,
+           hs = hs / total_pop,
+           income_high = income_high / total_pop,
+           married = married / total_pop,
+           no_hs = no_hs / total_pop,
+           pop_black = pop_black / total_pop,
+           pop_hispanic = pop_hispanic / total_pop,
+           pop_white = pop_white / total_pop,
+           speak_english = speak_english / total_pop,
+           speak_spanish = speak_spanish / total_pop)
+
+colnames(census)[1] <- 'zip'
+
+head(census)
+```
+
+
+## Dependent and Independent Variables
+
+The next step is to transform housing violations into a 'proper' dependent variable, accounting for time.
+
+Roll up violations by month:
+
+```{r}
+house_ts <- house %>%
+    mutate(epoch = as.Date(paste(year(inspectiondate), month(inspectiondate), '01', sep='-'), '%Y-%m-%d')) %>%
+    group_by(zip, epoch) %>%
+    summarise(violations = n()) %>%
+    arrange(zip, epoch)
+
+head(house_ts)
+```
+
+However---not every possible `(zip, epoch)` observation is included. The data set as it stands is missing all observations where `violations = 0`. To remedy this, we can conduct a cross join using `merge`:
+
+```{r}
+housing_obs <- unique(merge(house_ts$zip, house_ts$epoch, all=TRUE))
+colnames(housing_obs) <- c('zip', 'epoch')
+
+house_ts <- housing_obs %>%
+    left_join(house_ts, by=c('zip', 'epoch')) %>%
+    mutate(violations = replace_na(violations, 0)) %>%
+    arrange(zip, epoch)
+
+rm(housing_obs)
+head(house_ts)
+```
+
+Now let's perform a similar operation on `calls`:
+
+```{r}
+calls_ts <- calls %>%
+    mutate(epoch = as.Date(paste(year(created_date), month(created_date), '01', sep='-'), '%Y-%m-%d')) %>%
+    group_by(incident_zip, epoch) %>%
+    summarize(calls = n()) %>%
+    arrange(incident_zip, epoch)
+
+colnames(calls_ts) <- c('zip', 'epoch', 'calls')
+
+calls_obs <- unique(merge(calls_ts$zip, calls_ts$epoch, all=TRUE))
+colnames(calls_obs) <- c('zip', 'epoch')
+
+calls_ts <- calls_obs %>%
+    left_join(calls_ts, by=c('zip', 'epoch'))%>%
+    mutate(calls = replace_na(calls, 0)) %>%
+    arrange(zip, epoch)
+
+rm(calls_obs)
+
+head(calls_ts)
+```
+
+Finally, join to create the final data set:
+
+```{r, warning=FALSE, message=FALSE}
+calls_ts$zip <- as.factor(calls_ts$zip)
+house_ts$zip <- as.factor(house_ts$zip)
+census$zip <- as.factor(census$zip)
+
+df <- calls_ts %>%
+    inner_join(house_ts, by=c('zip', 'epoch')) %>%
+    left_join(census, by='zip') %>%
+    select(-NAME) %>%
+    filter(year(epoch) == 2014)
+
+df <- df[complete.cases(df), ]
+```
+
+
+Split into test and train sets:
+
+```{r}
+split_data <- function(df, proportion, seed) {
+    set.seed(seed)
+    n <- nrow(df)
+    n_train <- as.integer(n * proportion)
+    n_test <- n - n_train
+    index <- seq(1:n)
+    train_index <- sample(index, n_train)
+    train <- df[train_index,]
+    test <- df[-train_index,]
+    return(list('train'=train, 'test'=test))
+}
+
+split <- split_data(df, proportion=.75, seed=1804)
+train <- split$train
+test <- split$test
+
+write.table(train, '../data/clean/train.csv', row.names=FALSE)
+write.table(test, '../data/clean/test.csv', row.names=FALSE)
+
+# keep workspace clean
+rm(split, df, calls, census, house); gc()
+```
+
+
+
+# Exploratory Data Analysis
+
+First, let's get a sense of our two variables of interest: `violations` and `calls`.
+
+```{r}
+hist_vio <- ggplot(train, aes(x=violations)) + geom_histogram(binwidth=10)
+hist_calls <- ggplot(train, aes(x=calls)) + geom_histogram(binwidth=100)
+multiplot(hist_vio, hist_calls)
+
+quantile(train$violations, c(.1,.25, .5, .75, .9, .95, .99))
+quantile(train$calls, c(.1,.25, .5, .75, .9, .95, .99))
+```
+
+`calls` is a much nicer variable than `violations`. It has a distribution that can be much more reasonably called 'approximately normal.' It is still skewed, however, with a mean to the right of its median. `violations` is highly distorted, with lots of zeros and very long right tail. Seventy-five percent of `(zip, epoch)` observations have one or less violations.
+
+Let's examine the relationship between the two variables with a scatterplot:
+
+```{r, warning=FALSE, message=FALSE}
+ggplot(train, aes(x=calls, y=violations)) +
+    geom_point() +
+    geom_smooth()
+```
+
+There are two groups of observations in this plot: One which is clearly linear, and a cluster of observations with a wide range of calls but no housing violations. Hopefully adding demographic variables will help straighten this relationship out for the model.
+
+## Correlations
+
+The `corrplot` package creates a helpful visual to help us understand the correlations between our numeric variables:
+
+```{r}
+train_cor <- cor(train[, c(3:19)])
+corrplot(train_cor, type='lower')
+```
+
+This plot is informative. `violations` appears only weakly correlated to most of the variables. Meanwhile, `calls` is more strongly correlated to variables such as `below_poverty` (0.4), `median_age` (-0.42), and `speak_spanish` (0.31)---`total_pop` has a correlation of 0.77! This suggests that is might be wise to 'standardize' `calls` and `violations` by dividing both `total_pop`, to create a sort of '311 calls and housing violations per capita'. 
+
+The strongest correlations are between the demographic variables. For instance, the proportion of people in a zip code with bachelors degree is negatively correlated with the proportion of people that live below the poverty line. This is to be expected; we'll have to keep an eye on these correlations in the modeling stage.
+
+
+
+# Modeling
+
+The overall analytic strategy is to divide the full dataset into a train and test dataset---see above---train a number of models on it, apply the trained models to the test dataset, and evaluate each model according to mean squared error $MSE$. I will also pay attention to $R^2$, the percentage of variation in `violations` each model accounts for. However, $MSE$ is our primary measure to minimize.
+
+Because I use different kinds of models from different packages, it is helpful to have these measures explicitly coded:
+
+```{r}
+mse <- function(m) mean(resid(m)^2)
+
+calc_r2 <- function(y, y_hat) {
+    rss <- sum((y_hat - y)^2)
+    tss <- sum((y - mean(y_hat))^2)
+    return(1 - (rss/tss))
+}
+```
+
+
+## $M_0$: Dummy Model
+
+First, I create a dummy model that predicts the mean of `violations` for every observation. This will allow us to see how much more complicated models add to our predictive capability:
+
+```{r}
+m0 <- lm(violations ~ 1, train)
+```
+
+In-sample performance:
+
+```{r}
+mse(m0)
+calc_r2(train$violations, predict(m0, train))
+```
+
+Ideally, future models will have a much lower $MSE$ than 2140, and a much higher $R^2$ than 0. If they do not, we'll know we're not getting anywhere with this data set.
+
+
+## $M_1$: Simple Linear Regression
+
+The next model $M_1$ is a simple linear regression with all of the independent variables:
+
+```{r}
+m1 <- lm(violations ~ calls + bach_degree + bachelors + below_poverty +
+                      grad_degree + hs + income_high + married + median_age +
+                      no_hs + pop_black + pop_hispanic + pop_white +
+                      speak_english + speak_spanish + total_pop, train)
+summary(m1)
+mse(m1)
+```
+
+This model performs reasonably well for a first pass. Its $MSE = 1664$ is 22 percent less than $M_0$, and $R^2 = 0.22$. The $F$-statistic is very significant, confirming that this model performs better a dummy model. Interestingly, the intercept is not significant, i.e., it is not different from zero. In my view, this _could_ make sense if we can say that any housing violation is due solely to the independent variables.
+
+The intution underlying this paper, that 311 calls has something to do with housing violations, is confirmed by this model. The positive $\beta$ for `calls` indicates that as calls increase, so do housing violations. The estimate is significant at $p < .001$. 
+Interestingly, `total_pop` has a _negative_ relationship with `violations`. This is hard to square with intuition. _A priori_ it should be have a positive relationship. For now, I will not worry too much about this because the coefficient is very small.
+
+Let's examine the residuals:
+
+```{r}
+par(mfrow=c(1,2))
+hist(resid(m1))
+qqnorm(rstandard(m1)); qqline(rstandard(m1), col = 2)
+```
+
+It is clear $M_1$'s residuals deviate sharply from a normal distribution. There is a long right-tail, indicating there are quite a few outlying observations the model does not handle well. 
+
+Let's examine some of these leading residuals:
+
+```{r}
+train_m1 <- train %>%
+    mutate(pred = predict(m1, train),
+           resid = violations - pred) %>%
+    arrange(desc(resid))
+    
+head(train_m1[c('zip', 'epoch', 'resid')], 10)
+```
+
+$M_1$ appears to perform the worst in winter: January and February. This indicates that it may be possible to improve the model by adding a `month` variable.
+
+
+## $M_2$: Regression + Month
+
+To remedy this, let's conduct the same kind of regression but add a variable for month:
+
+```{r}
+train_m2 <- train %>%
+    mutate(month = month(epoch))
+
+m2 <- lm(violations ~ calls + bach_degree + bachelors + below_poverty +
+                      grad_degree + hs + income_high + married + median_age +
+                      no_hs + pop_black + pop_hispanic + pop_white +
+                      speak_english + speak_spanish + total_pop +
+                      as.factor(month), data=train_m2)
+summary(m2)
+mse(m2)
+```
+
+Adding `month` really helped! Almost all of the `month` variables are significant at $p < .001$. $MSE$ is almost a third less compared to $M_1$, and $R^2$ doubles from 0.22 to 0.44. 
+
+Accounting for `month` also makes intuitive sense: Winter is when people use heating, and New Yorkers are prone to having problems with their apartment's heat. This could naturally inspire more calls to the housing inspection authorities.
+
+Although `calls` remains highly sigificant, almost none of the other variables do. 
+
+Residual plots:
+
+```{r}
+par(mfrow=c(1,2))
+hist(resid(m2))
+qqnorm(rstandard(m2)); qqline(rstandard(m2), col = 2)
+```
+
+The shape of the residuals remains about the same compared to $M_1$, although notice the right-tail is smaller:
+
+```{r}
+max(resid(m1))
+max(resid(m2))
+```
+
+Let's re-check the leading residuals:
+
+```{r}
+train_m2 <- train_m2 %>%
+    mutate(pred = predict(m2, train_m2),
+           resid = violations - pred) %>%
+    arrange(desc(resid))
+    
+head(train_m2[c('zip', 'epoch', 'resid')], 10)
+```
+
+The residuals on the whole are smaller, but it appears to be the same observations that $M_1$ missed.
+
+
+## $M_3$: Mixed Effects Panel Model
+
+The three previous models have used vanilla linear regression. However, this is not analytically appropriate. Linear regression assumes that each observation is independent of eachother---which is not the case for this dataset. The number of housing violations in a zip code in month $t$ is not independent of the number of housing violations in month $t-1$. And as we've seen above, the number of housing violations in February is not independent of the number of housing violations in January.
+
+We can use mixed models to account for the fact that observations are sampled from the same 'unit' multiple times. I will not attempt to explain the underlying logic of these models here.
+
+`zip` and `month` are coded as random effects:
+
+```{r}
+train_m3 <- train %>%
+    mutate(month = as.factor(month(epoch)))
+
+m3 <- lmer(violations ~ calls + bach_degree + bachelors + below_poverty +
+                        grad_degree + hs + income_high + married + median_age +
+                        no_hs + pop_black + pop_hispanic + pop_white +
+                        speak_english + speak_spanish + total_pop + (1 | zip) +
+                        (1 | month), data=train_m3)
+
+summary(m3)
+mse(m3)
+calc_r2(train_m3$violations, predict(m3, train_m3))
+```
+
+Surprisingly, using this more appropriate method fails to decrease $MSE$ or improve $R^2$ over $M_2$ at all. In fact, the two models are nearly identical.
+
+
+## $M_4$: Dealing with Multicollinearity
+
+From the correlation plot and the some of the residuals, it seems likely that some or perhaps most of the demographic variables from the Census are correlated with eachother. This state of affairs, called _multicollinearity_, is harmful to the modeling process, because it can cause misestimation of coefficients. Training a model with less correlated variables should make the estimates more accurate, and increase the performance on the test set.
+
+Any sociologist can tell you that education level, poverty, income, and language are all related to eachother, primarily by class-exclusionary mechanisms. I will try to retain the essentials of this data while reducing the correlation:
+
+```{r}
+train_m4 <- train %>%
+    mutate(month = as.factor(month(epoch)),
+           college = bach_degree + grad_degree) %>%
+    select(-bach_degree, -bachelors, -grad_degree, -income_high, -pop_hispanic,
+           -pop_black, -speak_spanish, -hs)
+           
+m4 <- lmer(violations ~ calls + college + below_poverty + married + 
+                        median_age + no_hs + pop_white + speak_english + 
+                        total_pop + (1 | zip) + (1 | month), data=train_m4)
+
+summary(m4)
+mse(m4)
+calc_r2(train_m4$violations, predict(m4, train_m4))
+```
+
+$R^2$ and $MSE$ do not change much compared to the two previous models. However, we do see that some parameter estimates have changed quite drastically. This should result in improved performance on the test set, even if performance is unchanged on the in-sample training set.
+
+
+
+## Bonus: $M_5$: Zero-Inflated Poisson Regression
+
+_NOTE: This is new territory for me, just trying it out for the first time!_
+
+Since $M_4$ likely has done a better job with regard to multicollinearity, I am using it as the basis for this next model, a special kind of Poisson regression built to deal with dependent variables with excessive zeros. It is a part of the `pscl` package---[a UCLA web site](https://stats.idre.ucla.edu/r/dae/zip/) has a quick tutorial.
+
+```{r}
+train_m5 <- train %>%
+    mutate(month = as.factor(month(epoch)),
+           college = bach_degree + grad_degree) %>%
+    select(-bach_degree, -bachelors, -grad_degree, -income_high, -pop_hispanic,
+           -pop_black, -speak_spanish, -hs)
+
+m5 <- zeroinfl(violations ~ calls + below_poverty + pop_white + median_age + 
+               college | month, data=train_m5)
+
+summary(m5)
+mse(m5)
+calc_r2(train_m5$violations, predict(m5, train_m5))
+```
+
+I do not understand this $MSE$, presumably some kind of transformation has happened, but I'm not sure which. The $R^2 = 0.65$ looks great though---nearly fifty percent better than the last few models.
+
+
+
+# Model Evaluation
+
+It is finally time to evaluate each of these models on the test set!
+
+Prepare the test set for each model:
+
+```{r}
+test <- test %>% mutate(month = as.factor(month(epoch)))
+
+test_m0 <- test 
+test_m0 <- test_m0 %>%
+    mutate(pred = predict(m0, test_m0),
+           resid = violations - pred)
+
+test_m1 <- test
+test_m1 <- test_m1 %>% 
+    mutate(pred = predict(m1, test_m1),
+           resid = violations - pred)
+
+test_m2 <- test
+test_m2 <- test_m2 %>% 
+    mutate(pred = predict(m2, test_m2),
+           resid = violations - pred)
+
+test_m3 <- test
+test_m3 <- test_m3 %>% 
+    mutate(pred = predict(m3, test_m3),
+           resid = violations - pred)
+
+test_m4 <- test %>%
+    mutate(month = as.factor(month(epoch)),
+           college = bach_degree + grad_degree) %>%
+    select(-bach_degree, -bachelors, -grad_degree, -income_high, -pop_hispanic,
+           -pop_black, -speak_spanish, -hs)
+test_m4 <- test_m4 %>%
+    mutate(pred = predict(m4, test_m4),
+           resid = violations - pred)
+
+test_m5 <- test %>%
+    mutate(month = as.factor(month(epoch)),
+           college = bach_degree + grad_degree) %>%
+    select(-bach_degree, -bachelors, -grad_degree, -income_high, -pop_hispanic,
+           -pop_black, -speak_spanish, -hs)
+test_m5 <- test_m5 %>%
+    mutate(pred = predict(m5, test_m5),
+           resid = violations - pred)
+```
+
+Calculate $MSE$ for each model on the test set:
+
+```{r}
+paste('M_0:', mean(test_m0$resid^2))
+paste('M_1:', mean(test_m1$resid^2))
+paste('M_2:', mean(test_m2$resid^2))
+paste('M_3:', mean(test_m3$resid^2))
+paste('M_4:', mean(test_m4$resid^2))
+paste('M_5:', mean(test_m5$resid^2))
+```
+
+The Poisson regression equipped to deal with excessive zeros $M_5$ came out best, with almost 50 percent lower $MSE$ than the mixed effects models! As expected, accounting for `month` improved $M_2$ subtantially over $M_1$. Using a mixed model did not improve $M_3$ over $M_2$, surprisingly. Also a suprise $M_4$, the model to deal with multicollinearity, had only a slight improvement.
+
+Now let's look at $R^2$:
+
+```{r}
+paste('M_0:', calc_r2(test_m0$violations, test_m0$pred))
+paste('M_1:', calc_r2(test_m1$violations, test_m1$pred))
+paste('M_2:', calc_r2(test_m2$violations, test_m2$pred))
+paste('M_3:', calc_r2(test_m3$violations, test_m3$pred))
+paste('M_4:', calc_r2(test_m4$violations, test_m4$pred))
+paste('M_5:', calc_r2(test_m5$violations, test_m5$pred))
+```
+
+Interestingly, the $R^2$ for each model on the test set is higher than when applied to the training set. $M_5$ comes out the winner again, explaining almost 72 percent of variance in `violations`.
+
+
+
+# Conclusion
+
+This paper used open source data from New York City and the U.S. Census Bureau to predict monthly housing violations. A number of models were tested. The best model was a special kind of Poisson regression built to deal with dependent variables with excessive zeros. This model explained 72 percent of variation in housing violations.
+
+The percentage of people living below poverty in a zip code, and the percentage with college degrees, are positively associated with housing violations. A higher proportion of white people and young people are both negatively associated with housing violations.
+
+This paper was particularly interested in the number of calls made to 311 in a zip code could help predict the number of housing violations. Every model found a highly significant, positive relationship between the two, even when accounting for demographic variables and seasonality---every 1175 calls to 311 is associated with one additional housing violation.
+
+I would like to thank whomever wrote `tidycensus` for making this project a million times easier, and I am also fortunate that this Poisson model worked out so well.
