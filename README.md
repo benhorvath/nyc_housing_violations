@@ -1,1 +1,3 @@
 The purpose of this document is to explore the relationship between 311 calls and housing violations in New York City. After investigating their statistical properties, and incorporating demographic variables, I develop a number of successful models for predicting housing violations in NYC zip codes. After testing each model on a hold-out set, the best model was a special Poisson regression method that accounted for 72 percent of variation in housing violations.
+
+Read the report: http://rpubs.com/benhorvath/d607_final
